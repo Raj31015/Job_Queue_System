@@ -30,8 +30,13 @@ export class WorkerPool {
 
     // Stall detector — runs every 30s
     setInterval(async () => {
-      const recovered = await this.queue.recoverStalledJobs()
-      if (recovered > 0) logger.info(`[pool] recovered ${recovered} stalled jobs`)
+      try {
+        const recovered = await this.queue.recoverStalledJobs()
+        if (recovered > 0) logger.info(`[pool] recovered ${recovered} stalled jobs`)
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err)
+        logger.warn(`[pool] stalled job recovery skipped: ${error}`)
+      }
     }, 30_000)
   }
 
@@ -57,7 +62,6 @@ class Worker {
   private processedCount = 0
   private lastJobType?: string
   private heartbeatInterval?: ReturnType<typeof setInterval>
-  private pollInterval?: ReturnType<typeof setInterval>
 
   constructor(queue: Queue, redis: Redis, index: number) {
     this.id = `worker-${index}-${uuid().slice(0, 8)}`
@@ -70,19 +74,25 @@ class Worker {
     this.running = true
 
     // Register worker
-    this.redis.sadd(KEYS.workers, this.id)
+    this.redis.sadd(KEYS.workers, this.id).catch(err => {
+      const error = err instanceof Error ? err.message : String(err)
+      logger.warn(`[worker:${this.id}] failed to register in Redis: ${error}`)
+    })
 
     // Heartbeat every 10s — proof of life for stall detection
     this.heartbeatInterval = setInterval(() => {
-      this.redis.set(KEYS.workerHB(this.id), Date.now().toString(), 'EX', 60)
-    }, 10_000)
+      this.redis.set(KEYS.workerHB(this.id), Date.now().toString(), 'EX', 60).catch(err => {
+        const error = err instanceof Error ? err.message : String(err)
+        logger.warn(`[worker:${this.id}] heartbeat skipped: ${error}`)
+      })
+    }, 30_000)
     // Initial heartbeat
-    this.redis.set(KEYS.workerHB(this.id), Date.now().toString(), 'EX', 60)
+    this.redis.set(KEYS.workerHB(this.id), Date.now().toString(), 'EX', 60).catch(err => {
+      const error = err instanceof Error ? err.message : String(err)
+      logger.warn(`[worker:${this.id}] initial heartbeat skipped: ${error}`)
+    })
 
-    // Poll loop — check for jobs every 500ms when idle
-    this.pollInterval = setInterval(() => {
-      if (!this.busy) this.poll()
-    }, 500)
+    void this.runLoop()
 
     logger.info(`[worker:${this.id}] started`)
   }
@@ -90,16 +100,24 @@ class Worker {
   stop(): void {
     this.running = false
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval)
-    if (this.pollInterval) clearInterval(this.pollInterval)
-    this.redis.srem(KEYS.workers, this.id)
+    this.redis.srem(KEYS.workers, this.id).catch(err => {
+      const error = err instanceof Error ? err.message : String(err)
+      logger.warn(`[worker:${this.id}] failed to unregister from Redis: ${error}`)
+    })
     logger.info(`[worker:${this.id}] stopped`)
+  }
+
+  private async runLoop(): Promise<void> {
+    while (this.running) {
+      await this.poll()
+    }
   }
 
   private async poll(): Promise<void> {
     if (!this.running || this.busy) return
 
     try {
-      const job = await this.queue.dequeue(this.id)
+      const job = await this.queue.dequeue(this.id, 10)
       if (!job) return
 
       this.busy = true

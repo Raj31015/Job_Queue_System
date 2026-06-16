@@ -8,6 +8,7 @@ import { logger } from '../logger'
 
 export class Queue {
   private redis: Redis
+  private promotingScheduled = false
 
   constructor(redis: Redis) {
     this.redis = redis
@@ -18,9 +19,10 @@ export class Queue {
   async enqueue(
     type: string,
     payload: Record<string, unknown>,
-    options: EnqueueOptions = {}
+    options: EnqueueOptions
   ): Promise<Job> {
     const {
+      sessionId,
       priority = 'normal',
       maxAttempts = 3,
       delay = 0,
@@ -32,6 +34,7 @@ export class Queue {
 
     const job: Job = {
       id: uuid(),
+      sessionId,
       type,
       payload,
       priority,
@@ -69,57 +72,50 @@ export class Queue {
   // Returns next available job, respecting priority order.
   // Uses a Redis lock to prevent double-processing by concurrent workers.
 
-  async dequeue(workerId: string): Promise<Job | null> {
-    // Promote any scheduled jobs that are now due
-    await this.promoteScheduled()
+  async dequeue(workerId: string, blockTimeoutSeconds = 5): Promise<Job | null> {
+    const queueKeys = PRIORITY_ORDER.map(priority => PRIORITY_QUEUES[priority])
+    const result = await this.redis.brpop(...queueKeys, blockTimeoutSeconds)
+    if (!result) return null
 
-    for (const priority of PRIORITY_ORDER) {
-      const queueKey = PRIORITY_QUEUES[priority]
+    const [, jobId] = result
+    if (!jobId) return null
 
-      // RPOP from the right (oldest item) — non-blocking
-      const jobId = await this.redis.rpop(queueKey)
-      if (!jobId) continue
+    // Acquire a lock for this job (NX = only set if not exists, PX = TTL ms)
+    // This prevents two workers from processing the same job if a stale item is returned.
+    const lockKey = KEYS.lock(jobId)
+    const locked = await this.redis.set(lockKey, workerId, 'PX', 30_000, 'NX')
 
-      // Acquire a lock for this job (NX = only set if not exists, PX = TTL ms)
-      // This prevents two workers from processing the same job if rpop races
-      const lockKey = KEYS.lock(jobId)
-      const locked = await this.redis.set(lockKey, workerId, 'PX', 30_000, 'NX')
-
-      if (!locked) {
-        // Another worker grabbed it — skip and try next
-        logger.warn(`[queue] failed to lock job ${jobId}, skipping`)
-        continue
-      }
-
-      const job = await this.getJob(jobId)
-      if (!job) {
-        await this.redis.del(lockKey)
-        continue
-      }
-
-      // Mark as active
-      const now = Date.now()
-      const updates: Partial<Job> = {
-        status: 'active',
-        workerId,
-        startedAt: now,
-        attempts: job.attempts + 1,
-      }
-
-      await this.redis.hset(KEYS.jobData(jobId), this.serialize(updates))
-      await this.redis.sadd(KEYS.active, jobId)
-
-      const updatedJob = { ...job, ...updates }
-
-      await this.redis.publish(KEYS.events, JSON.stringify({
-        event: 'job:started', job: updatedJob
-      }))
-
-      logger.info(`[queue] worker ${workerId} dequeued job ${jobId} (${job.type})`)
-      return updatedJob
+    if (!locked) {
+      logger.warn(`[queue] failed to lock job ${jobId}, skipping`)
+      return null
     }
 
-    return null
+    const job = await this.getJob(jobId)
+    if (!job) {
+      await this.redis.del(lockKey)
+      return null
+    }
+
+    // Mark as active
+    const now = Date.now()
+    const updates: Partial<Job> = {
+      status: 'active',
+      workerId,
+      startedAt: now,
+      attempts: job.attempts + 1,
+    }
+
+    await this.redis.hset(KEYS.jobData(jobId), this.serialize(updates))
+    await this.redis.sadd(KEYS.active, jobId)
+
+    const updatedJob = { ...job, ...updates }
+
+    await this.redis.publish(KEYS.events, JSON.stringify({
+      event: 'job:started', job: updatedJob
+    }))
+
+    logger.info(`[queue] worker ${workerId} dequeued job ${jobId} (${job.type})`)
+    return updatedJob
   }
 
   // ─── Acknowledge (success) ────────────────────────────────────────────────
@@ -200,25 +196,34 @@ export class Queue {
   // when their runAt timestamp has passed.
 
   async promoteScheduled(): Promise<number> {
+    if (this.promotingScheduled) return 0
+    this.promotingScheduled = true
+
     const now = Date.now()
-    // ZRANGEBYSCORE: get all jobs with score <= now (i.e. due to run)
-    const dueJobIds = await this.redis.zrangebyscore(KEYS.scheduled, 0, now)
+    try {
+      // ZRANGEBYSCORE: get all jobs with score <= now (i.e. due to run)
+      const dueJobIds = await this.redis.zrangebyscore(KEYS.scheduled, 0, now)
 
-    if (dueJobIds.length === 0) return 0
+      if (dueJobIds.length === 0) return 0
 
-    for (const jobId of dueJobIds) {
-      const job = await this.getJob(jobId)
-      if (!job) {
-        await this.redis.zrem(KEYS.scheduled, jobId)
-        continue
+      for (const jobId of dueJobIds) {
+        // Remove first so concurrent scheduler ticks do not promote duplicates.
+        const removed = await this.redis.zrem(KEYS.scheduled, jobId)
+        if (removed === 0) continue
+
+        const job = await this.getJob(jobId)
+        if (!job) {
+          continue
+        }
+
+        await this.redis.lpush(PRIORITY_QUEUES[job.priority], jobId)
+        logger.info(`[scheduler] promoted job ${jobId} to ${job.priority} queue`)
       }
 
-      await this.redis.lpush(PRIORITY_QUEUES[job.priority], jobId)
-      await this.redis.zrem(KEYS.scheduled, jobId)
-      logger.info(`[scheduler] promoted job ${jobId} to ${job.priority} queue`)
+      return dueJobIds.length
+    } finally {
+      this.promotingScheduled = false
     }
-
-    return dueJobIds.length
   }
 
   // ─── Stall detection ─────────────────────────────────────────────────────
@@ -306,6 +311,7 @@ export class Queue {
   private deserialize(data: Record<string, string>): Job {
     return {
       id: data.id,
+      sessionId: data.sessionId,
       type: data.type,
       payload: JSON.parse(data.payload || '{}'),
       priority: data.priority as JobPriority,

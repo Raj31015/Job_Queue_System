@@ -3,6 +3,7 @@ export type JobStatus = 'waiting' | 'active' | 'completed' | 'failed' | 'dead'
 
 export interface Job {
   id: string
+  sessionId: string
   type: string
   payload: Record<string, unknown>
   priority: JobPriority
@@ -21,6 +22,7 @@ export interface Job {
 }
 
 export interface EnqueueOptions {
+  sessionId: string
   priority?: JobPriority
   maxAttempts?: number
   delay?: number         // ms from now

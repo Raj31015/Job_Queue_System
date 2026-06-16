@@ -5,6 +5,8 @@ type JobStatus = 'waiting' | 'active' | 'completed' | 'failed' | 'dead'
 
 type Job = {
   id: string
+  session_id?: string
+  sessionId?: string
   type: string
   payload: Record<string, unknown>
   priority: JobPriority
@@ -44,6 +46,7 @@ type JobEvent = { event: string; job?: Job; retryIn?: number }
 type StreamEvent = StatsEvent | JobEvent
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:4000/api'
+const SESSION_STORAGE_KEY = 'taskflow.session.id'
 
 const statusTone: Record<JobStatus, string> = {
   waiting: 'bg-[#1e293b] text-[#93c5fd]',     // slate blue
@@ -69,6 +72,7 @@ const seedJobs = [
 ]
 
 function App() {
+  const [sessionId] = useState(() => getOrCreateSessionId())
   const [stats, setStats] = useState<Stats>({})
   const [workers, setWorkers] = useState<WorkerStatus[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
@@ -84,8 +88,8 @@ function App() {
     const load = async () => {
       try {
         const [statsRes, jobsRes, typesRes] = await Promise.all([
-          fetch(`${API_BASE}/stats`),
-          fetch(`${API_BASE}/jobs?limit=8`),
+          fetch(`${API_BASE}/stats`, { headers: sessionHeaders(sessionId) }),
+          fetch(`${API_BASE}/jobs?limit=8`, { headers: sessionHeaders(sessionId) }),
           fetch(`${API_BASE}/job-types`),
         ])
 
@@ -108,7 +112,7 @@ function App() {
 
     load()
 
-    const source = new EventSource(`${API_BASE}/events`)
+    const source = new EventSource(`${API_BASE}/events?sessionId=${encodeURIComponent(sessionId)}`)
 
     source.onopen = () => setConnected(true)
     source.onerror = () => setConnected(false)
@@ -142,7 +146,7 @@ function App() {
       mounted = false
       source.close()
     }
-  }, [])
+  }, [sessionId])
 
   const totals = useMemo(() => {
     const enqueued = stats.total_enqueued ?? 0
@@ -176,6 +180,7 @@ function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...sessionHeaders(sessionId),
         },
         body: JSON.stringify({
           jobs: buildDemoJobs(),
@@ -225,6 +230,9 @@ function App() {
                       Drops a mixed set of email, PDF, image, sync, and webhook jobs into the queue.
                     </p>
                   </div>
+                  <p className="mt-3 text-xs uppercase tracking-[0.18em] text-[#7f94b8]">
+                    session {sessionId.slice(0, 8)}
+                  </p>
                   {demoMessage ? (
                     <p className="mt-3 text-sm text-[#bfd4ff]">{demoMessage}</p>
                   ) : null}
@@ -571,3 +579,16 @@ function buildDemoJobs() {
 }
 
 export default App
+
+function getOrCreateSessionId() {
+  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY)
+  if (existing) return existing
+
+  const created = window.crypto.randomUUID()
+  window.localStorage.setItem(SESSION_STORAGE_KEY, created)
+  return created
+}
+
+function sessionHeaders(sessionId: string) {
+  return { 'x-session-id': sessionId }
+}

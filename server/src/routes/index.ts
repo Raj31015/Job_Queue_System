@@ -3,16 +3,21 @@ import Redis from 'ioredis'
 import { Queue } from '../queue/Queue'
 import { KEYS, JobPriority } from '../queue/types'
 import { jobHandlers } from '../jobs/handlers'
-import { getJobHistory } from '../db'
+import { getJobHistory, getSessionStats } from '../db'
 import { WorkerPool } from '../workers/WorkerPool'
 import { logger } from '../logger'
 
 export function createRouter(queue: Queue, redis: Redis, pool: WorkerPool): Router {
   const router = Router()
+  const getSessionId = (req: Request) => {
+    const value = req.header('x-session-id') ?? req.query.sessionId
+    return typeof value === 'string' && value.trim() ? value.trim() : 'anonymous'
+  }
 
   // ─── Enqueue a job ────────────────────────────────────────────────────────
   router.post('/jobs', async (req: Request, res: Response) => {
     try {
+      const sessionId = getSessionId(req)
       const { type, payload = {}, priority = 'normal', maxAttempts, delay, runAt } = req.body
 
       if (!type) return res.status(400).json({ error: 'type is required' })
@@ -24,6 +29,7 @@ export function createRouter(queue: Queue, redis: Redis, pool: WorkerPool): Rout
       }
 
       const job = await queue.enqueue(type, payload, {
+        sessionId,
         priority: priority as JobPriority,
         maxAttempts,
         delay,
@@ -39,21 +45,25 @@ export function createRouter(queue: Queue, redis: Redis, pool: WorkerPool): Rout
 
   // ─── Get job by ID ────────────────────────────────────────────────────────
   router.get('/jobs/:id', async (req: Request, res: Response) => {
+    const sessionId = getSessionId(req)
     const job = await queue.getJob(req.params.id)
     if (!job) return res.status(404).json({ error: 'Job not found' })
+    if (job.sessionId !== sessionId) return res.status(404).json({ error: 'Job not found' })
     res.json(job)
   })
 
   // ─── Job history from Postgres ────────────────────────────────────────────
   router.get('/jobs', async (req: Request, res: Response) => {
+    const sessionId = getSessionId(req)
     const { status, limit = '50' } = req.query
-    const jobs = await getJobHistory(parseInt(limit as string), status as string)
+    const jobs = await getJobHistory(sessionId, parseInt(limit as string), status as string)
     res.json(jobs)
   })
 
   // ─── Queue stats ──────────────────────────────────────────────────────────
-  router.get('/stats', async (_req: Request, res: Response) => {
-    const stats = await queue.getStats()
+  router.get('/stats', async (req: Request, res: Response) => {
+    const sessionId = getSessionId(req)
+    const stats = await getSessionStats(sessionId)
     const workers = pool.getStatus()
     res.json({ stats, workers })
   })
@@ -70,19 +80,21 @@ export function createRouter(queue: Queue, redis: Redis, pool: WorkerPool): Rout
 
   // ─── Bulk enqueue (for demo/testing) ─────────────────────────────────────
   router.post('/jobs/bulk', async (req: Request, res: Response) => {
+    const sessionId = getSessionId(req)
     const { jobs } = req.body as {
       jobs: Array<{ type: string; payload?: Record<string, unknown>; priority?: string }>
     }
     if (!Array.isArray(jobs)) return res.status(400).json({ error: 'jobs must be an array' })
 
     const results = await Promise.all(
-      jobs.map(j => queue.enqueue(j.type, j.payload ?? {}, { priority: j.priority as JobPriority }))
+      jobs.map(j => queue.enqueue(j.type, j.payload ?? {}, { sessionId, priority: j.priority as JobPriority }))
     )
     res.status(201).json({ ok: true, count: results.length, jobs: results })
   })
 
   // ─── SSE stream — real-time events to dashboard ───────────────────────────
   router.get('/events', (req: Request, res: Response) => {
+    const sessionId = getSessionId(req)
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('Connection', 'keep-alive')
@@ -94,12 +106,18 @@ export function createRouter(queue: Queue, redis: Redis, pool: WorkerPool): Rout
     subscriber.subscribe(KEYS.events)
 
     subscriber.on('message', (_channel, message) => {
-      res.write(`data: ${message}\n\n`)
+      try {
+        const payload = JSON.parse(message) as { job?: { sessionId?: string } }
+        if (payload.job?.sessionId !== sessionId) return
+        res.write(`data: ${message}\n\n`)
+      } catch (error) {
+        logger.warn(`[events] failed to stream session event: ${error}`)
+      }
     })
 
     // Send stats every 2s
     const statsInterval = setInterval(async () => {
-      const stats = await queue.getStats()
+      const stats = await getSessionStats(sessionId)
       const workers = pool.getStatus()
       res.write(`data: ${JSON.stringify({ event: 'stats', stats, workers })}\n\n`)
     }, 2000)

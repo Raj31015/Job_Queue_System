@@ -16,6 +16,7 @@ export async function migrate(): Promise<void> {
     await client.query(`
       CREATE TABLE IF NOT EXISTS job_log (
         id           TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL DEFAULT 'anonymous',
         type         TEXT NOT NULL,
         payload      JSONB NOT NULL DEFAULT '{}',
         priority     TEXT NOT NULL DEFAULT 'normal',
@@ -25,13 +26,18 @@ export async function migrate(): Promise<void> {
         error        TEXT,
         result       JSONB,
         worker_id    TEXT,
+        run_at       TIMESTAMPTZ,
         created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         started_at   TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
         failed_at    TIMESTAMPTZ
       );
 
+      ALTER TABLE job_log ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT 'anonymous';
+      ALTER TABLE job_log ADD COLUMN IF NOT EXISTS run_at TIMESTAMPTZ;
+
       CREATE INDEX IF NOT EXISTS idx_job_log_status   ON job_log(status);
+      CREATE INDEX IF NOT EXISTS idx_job_log_session  ON job_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_job_log_type     ON job_log(type);
       CREATE INDEX IF NOT EXISTS idx_job_log_created  ON job_log(created_at DESC);
 
@@ -54,44 +60,69 @@ export async function migrate(): Promise<void> {
 
 // Persist job state to Postgres for history / analytics
 export async function persistJob(job: {
-  id: string; type: string; payload: Record<string, unknown>
+  id: string; sessionId: string; type: string; payload: Record<string, unknown>
   priority: string; status: string; attempts: number; maxAttempts: number
   error?: string; result?: unknown; workerId?: string
-  createdAt: number; startedAt?: number; completedAt?: number; failedAt?: number
+  runAt: number; createdAt: number; startedAt?: number; completedAt?: number; failedAt?: number
 }): Promise<void> {
   await pool.query(`
-    INSERT INTO job_log (id, type, payload, priority, status, attempts, max_attempts,
-      error, result, worker_id, created_at, started_at, completed_at, failed_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-      to_timestamp($11/1000.0),
+    INSERT INTO job_log (id, session_id, type, payload, priority, status, attempts, max_attempts,
+      error, result, worker_id, run_at, created_at, started_at, completed_at, failed_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
       to_timestamp($12/1000.0),
       to_timestamp($13/1000.0),
-      to_timestamp($14/1000.0))
+      to_timestamp($14/1000.0),
+      to_timestamp($15/1000.0),
+      to_timestamp($16/1000.0))
     ON CONFLICT (id) DO UPDATE SET
+      session_id    = EXCLUDED.session_id,
       status       = EXCLUDED.status,
       attempts     = EXCLUDED.attempts,
       error        = EXCLUDED.error,
       result       = EXCLUDED.result,
       worker_id    = EXCLUDED.worker_id,
+      run_at       = EXCLUDED.run_at,
       started_at   = EXCLUDED.started_at,
       completed_at = EXCLUDED.completed_at,
       failed_at    = EXCLUDED.failed_at
   `, [
-    job.id, job.type, job.payload, job.priority, job.status,
+    job.id, job.sessionId, job.type, job.payload, job.priority, job.status,
     job.attempts, job.maxAttempts, job.error || null,
     job.result ? JSON.stringify(job.result) : null,
     job.workerId || null,
-    job.createdAt, job.startedAt || null, job.completedAt || null, job.failedAt || null,
+    job.runAt, job.createdAt, job.startedAt || null, job.completedAt || null, job.failedAt || null,
   ])
 }
 
-export async function getJobHistory(limit = 100, status?: string): Promise<object[]> {
+export async function getJobHistory(sessionId: string, limit = 100, status?: string): Promise<object[]> {
   const query = status
-    ? `SELECT * FROM job_log WHERE status = $1 ORDER BY created_at DESC LIMIT $2`
-    : `SELECT * FROM job_log ORDER BY created_at DESC LIMIT $1`
-  const params = status ? [status, limit] : [limit]
+    ? `SELECT * FROM job_log WHERE session_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3`
+    : `SELECT * FROM job_log WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`
+  const params = status ? [sessionId, status, limit] : [sessionId, limit]
   const res = await pool.query(query, params)
   return res.rows
+}
+
+export async function getSessionStats(sessionId: string): Promise<Record<string, number>> {
+  const res = await pool.query(`
+    SELECT
+      COUNT(*)::int AS total_enqueued,
+      COUNT(*) FILTER (WHERE status = 'completed')::int AS total_completed,
+      COUNT(*) FILTER (WHERE status = 'dead')::int AS total_dead,
+      COUNT(*) FILTER (WHERE status = 'active')::int AS queue_active,
+      COUNT(*) FILTER (WHERE status = 'dead')::int AS queue_dead,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND priority = 'critical' AND (run_at IS NULL OR run_at <= NOW()))::int AS queue_critical,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND priority = 'high' AND (run_at IS NULL OR run_at <= NOW()))::int AS queue_high,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND priority = 'normal' AND (run_at IS NULL OR run_at <= NOW()))::int AS queue_normal,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND priority = 'low' AND (run_at IS NULL OR run_at <= NOW()))::int AS queue_low,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND run_at > NOW())::int AS queue_scheduled,
+      COUNT(*) FILTER (WHERE status = 'waiting' AND error IS NOT NULL)::int AS total_failed
+    FROM job_log
+    WHERE session_id = $1
+  `, [sessionId])
+
+  const row = res.rows[0] ?? {}
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, Number(value) || 0]))
 }
 
 export async function snapshotThroughput(stats: Record<string, number>): Promise<void> {
